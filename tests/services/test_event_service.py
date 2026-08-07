@@ -25,7 +25,7 @@ async def test_should_create_event(mongodb_client):
 @pytest.mark.asyncio
 async def test_should_find_event_by_id(mongodb_client):
     service = EventService(mongodb_client)
-
+    print(type(mongodb_client))
     event = Event(
         name="Order Created",
         payload={"order_id": 456},

@@ -11,10 +11,13 @@ def mongodb_container():
         yield mongo
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 async def mongodb_client(mongodb_container):
     client = AsyncIOMotorClient(mongodb_container.get_connection_url())
 
-    yield client
+    db = client["test_database"]
+
+    await db["events"].delete_many({})
+    yield db
 
     client.close()
