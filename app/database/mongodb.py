@@ -1,9 +1,8 @@
 import asyncio
 import logging
 
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from app.core.settings import settings
-
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +26,13 @@ async def disconnect_from_mongo():
         client.close()
 
         logger.info("Successfully disconnected from MongoDB.")
+
+
+def get_database() -> AsyncIOMotorDatabase:
+    if client is None:
+        raise RuntimeError("MongoDB client is not initialized")
+
+    return client[settings.mongo_database]
 
 
 async def main():
