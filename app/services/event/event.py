@@ -1,15 +1,39 @@
 from uuid import UUID
+import json
+from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.schemas.event import Event
+from app.services.redis import RedisService
+from app.services.event.event_queue import EventQueue
 
 
 class EventService:
-    def __init__(self, database: AsyncIOMotorDatabase):
+    def __init__(self, database: AsyncIOMotorDatabase, redis_service: RedisService | None = None):
         self.collection = database["events"]
+        self.redis_service = redis_service
+        self.queue = EventQueue(redis_service) if redis_service is not None else None
 
     async def create(self, event: Event) -> Event:
+        """
+        If Redis is available, publish the event to the queue (fast path).
+        Otherwise, persist directly to MongoDB.
+        """
+        if self.queue is not None:
+            await self.queue.publish(event)
+            return event
+
+        await self.collection.insert_one(event.model_dump(mode="json"))
+        return event
+
+    async def create_from_dict(self, data: dict[str, Any]) -> Event:
+        """Validate a dict as an Event and persist it to MongoDB.
+
+        This is intended for workers that consume the queue and then persist
+        events to the database.
+        """
+        event = Event.model_validate(data)
         await self.collection.insert_one(event.model_dump(mode="json"))
         return event
 
