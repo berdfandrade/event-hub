@@ -7,7 +7,7 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 
 @router.post("/events", status_code=status.HTTP_201_CREATED)
-async def receive_envent(
+async def receive_event(
     event: Event, service: EventService = Depends(get_event_service)
 ):
     created_event = await service.create(event)
