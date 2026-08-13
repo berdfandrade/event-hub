@@ -1,6 +1,9 @@
 from redis.asyncio import Redis
 
 
+from redis.asyncio import Redis
+
+
 class RedisService:
     def __init__(self, redis: Redis):
         self.redis = redis
@@ -31,3 +34,19 @@ class RedisService:
     async def delete(self, key: str) -> bool:
         result = await self.redis.delete(key)
         return result > 0
+
+    async def push(self, key: str, value: str):
+        await self.redis.rpush(key, value)
+
+    async def blocking_pop(self, key: str) -> str | None:
+        result = await self.redis.blpop(key)
+
+        if result is None:
+            return None
+
+        _, value = result
+
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+
+        return value
