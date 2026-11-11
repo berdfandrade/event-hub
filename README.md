@@ -1,79 +1,83 @@
 # Event Hub
 
-O **Event Hub** é uma API em Python (FastAPI) que **recebe eventos de outros sistemas via webhook e os processa em segundo plano**, de forma assíncrona e confiável.
+**Event Hub** is a Python API built with FastAPI that **receives events from other systems via webhooks and processes them asynchronously in the background**, reliably and without blocking the sender.
 
-Em vez de o sistema que envia o evento ficar esperando todo o processamento terminar, o Event Hub responde na hora (`202 Accepted`), guarda o evento e entrega o trabalho para um *worker*. Se algo der errado no processamento, o evento é tentado de novo automaticamente; se continuar falhando, ele fica separado para análise e pode ser reprocessado manualmente.
+Instead of making the system sending the event wait for the entire processing workflow to finish, Event Hub immediately responds with `202 Accepted`, stores the event, and delegates the work to a _worker_. If something goes wrong during processing, the event is automatically retried. If it continues to fail, it is moved to a separate queue for inspection and can be manually reprocessed.
 
-## Para que serve
+## What is it for?
 
-Use o Event Hub quando vários serviços precisam avisar uns aos outros que algo aconteceu, por exemplo:
+Use Event Hub when multiple services need to notify each other that something has happened. For example:
 
-- o serviço de autenticação avisa `user.created` e o Event Hub envia o e-mail de boas-vindas;
-- a loja avisa `order.paid` e o Event Hub atualiza o estoque e emite a nota;
-- um provedor externo (pagamento, CRM etc.) manda webhooks que precisam ser tratados sem perder nenhum.
+- An authentication service emits `user.created`, and Event Hub sends a welcome email.
+- An online store emits `order.paid`, and Event Hub updates inventory and generates an invoice.
+- An external provider (payment gateway, CRM, etc.) sends webhooks that must be handled reliably without losing events.
 
-O que ele resolve:
+What it solves:
 
-| Problema | Como o Event Hub trata |
-|---|---|
-| Processamento lento travando quem envia o evento | Responde `202` imediatamente e processa depois |
-| Falhas temporárias (API fora, timeout) | Retry automático com espera crescente (backoff exponencial) |
-| Eventos que nunca vão dar certo | Após N tentativas vão para uma *dead-letter queue* e ficam `failed` |
-| Webhooks reenviados em duplicidade | Header `Idempotency-Key` evita processar o mesmo evento duas vezes |
-| Worker cai no meio do processamento | O evento volta para a fila quando o worker reinicia |
-| "O que aconteceu com o meu evento?" | Cada evento tem status consultável por API |
+| Problem                                     | How Event Hub handles it                                                         |
+| ------------------------------------------- | -------------------------------------------------------------------------------- |
+| Slow processing blocking the event sender   | Immediately responds with `202` and processes the event asynchronously           |
+| Temporary failures (API downtime, timeouts) | Automatic retries with increasing delays (exponential backoff)                   |
+| Events that keep failing                    | After N attempts, they are moved to a _dead-letter queue_ and marked as `failed` |
+| Duplicate webhook deliveries                | The `Idempotency-Key` header prevents the same event from being processed twice  |
+| Worker crashes during processing            | The event is returned to the queue when the worker restarts                      |
+| "What happened to my event?"                | Every event has a queryable status exposed through the API                       |
 
-## Como funciona
+## How it works
 
+```text
+ External Service                 Event Hub API                     Worker(s)
+ ────────────────                 ─────────────                     ─────────
+ POST /webhooks/events ───────►  1. Stores event in MongoDB (pending)
+                                 2. Adds event ID to the Redis queue
+       ◄────── 202 Accepted ──   3. Responds immediately
+                                                    ┌──────────►  4. Fetches event from queue
+                                                    │             5. Executes handlers
+                                                    │             6. Updates status in MongoDB
+                                  Retry queue ──────┘                ├─ success → completed
+                                  (with delay)    ◄─────────────────┼─ error   → retrying
+                                                                     └─ exhausted → failed (dead-letter)
 ```
- Serviço externo                 Event Hub API                     Worker(s)
- ───────────────                 ─────────────                     ─────────
- POST /webhooks/events ───────►  1. grava no MongoDB (pending)
-                                 2. coloca o ID na fila (Redis)
-       ◄────── 202 Accepted ──   3. responde na hora
-                                                     ┌──────────►  4. pega o evento da fila
-                                                     │             5. executa os handlers
-                                                     │             6. atualiza o status no MongoDB
-                                    fila de retries ─┘                ├─ sucesso → completed
-                                    (com atraso)    ◄─────────────────┼─ erro    → retrying
-                                                                      └─ esgotou → failed (dead-letter)
-```
 
-- **MongoDB** guarda o evento completo e seu histórico de status (é a fonte da verdade).
-- **Redis** guarda apenas os IDs nas filas: a fila principal, a de retries agendados e a dead-letter.
-- **Worker** é um processo separado da API. Você pode rodar quantos quiser para dar conta de mais volume.
+- **MongoDB** stores the complete event and its status history (the source of truth).
+- **Redis** stores only event IDs in the queues: the main queue, the scheduled retry queue, and the dead-letter queue.
+- **Worker** runs as a separate process from the API. You can run as many workers as needed to handle higher workloads.
 
-### Ciclo de vida de um evento
+### Event lifecycle
 
-```
+```text
 pending ──► processing ──► completed
-                │
-                ├──► retrying ──► processing ──► ...
-                │
-                └──► failed  ──(POST /events/{id}/retry)──► pending
+                 │
+                 ├──► retrying ──► processing ──► ...
+                 │
+                 └──► failed ──(POST /events/{id}/retry)──► pending
 ```
 
-| Status | Significado |
-|---|---|
-| `pending` | Recebido e na fila, aguardando um worker |
-| `processing` | Um worker está executando os handlers |
-| `retrying` | Falhou, mas vai ser tentado de novo após um intervalo |
-| `completed` | Todos os handlers executaram com sucesso |
-| `failed` | Esgotou as tentativas (ou não pôde ser enfileirado) |
+| Status       | Meaning                                                                |
+| ------------ | ---------------------------------------------------------------------- |
+| `pending`    | Received and queued, waiting for a worker                              |
+| `processing` | A worker is executing the handlers                                     |
+| `retrying`   | Processing failed, but another attempt is scheduled after a delay      |
+| `completed`  | All handlers executed successfully                                     |
+| `failed`     | All retry attempts were exhausted (or the event could not be enqueued) |
 
-## Rodando localmente
+## Running locally
 
-Pré-requisitos: Python 3.12+ e Docker.
+Prerequisites: Python 3.12+ and Docker.
+
+Create and activate a virtual environment:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 ```
 
+Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Crie o `.env` na raiz:
+Create a `.env` file in the project root:
 
 ```env
 MONGO_URI=mongodb://localhost:27017
@@ -81,7 +85,7 @@ MONGO_DATABASE=eventhub
 REDIS_URL=redis://localhost:6379/0
 ```
 
-Suba MongoDB e Redis, depois a API e o worker (em terminais separados):
+Start MongoDB and Redis, then run the API and worker in separate terminals:
 
 ```bash
 docker compose up -d
@@ -95,40 +99,44 @@ uvicorn app.main:app --reload
 python -m app.workers.event_worker
 ```
 
-> Em desenvolvimento, dá para rodar o worker dentro da própria API com `RUN_EMBEDDED_WORKER=true uvicorn app.main:app --reload`.
+> During development, you can also run the worker inside the API process by setting `RUN_EMBEDDED_WORKER=true`:
 
-A documentação interativa fica em <http://localhost:8000/docs>.
+```bash
+RUN_EMBEDDED_WORKER=true uvicorn app.main:app --reload
+```
 
-## Exemplo de uso
+Interactive API documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs).
 
-Enviar um evento:
+## Usage example
+
+Send an event:
 
 ```bash
 curl -i -X POST http://localhost:8000/webhooks/events \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: pedido-123" \
+  -H "Idempotency-Key: order-123" \
   -d '{"name": "order.paid", "source": "shop", "payload": {"order_id": 123}}'
 ```
 
-Resposta (`202 Accepted`, com header `Location: /events/<id>`):
+Response (`202 Accepted`, with a `Location: /events/<id>` header):
 
 ```json
 {
   "id": "178f3ad6-0b24-42fa-8589-b6b32effa24b",
   "name": "order.paid",
   "source": "shop",
-  "payload": {"order_id": 123},
+  "payload": { "order_id": 123 },
   "status": "pending",
   "attempts": 0,
   "last_error": null,
-  "idempotency_key": "pedido-123",
+  "idempotency_key": "order-123",
   "created_at": "2026-11-11T12:55:46.456000Z",
   "updated_at": "2026-11-11T12:55:46.456000Z",
   "processed_at": null
 }
 ```
 
-Acompanhar o evento:
+Track the event:
 
 ```bash
 curl http://localhost:8000/events/178f3ad6-0b24-42fa-8589-b6b32effa24b
@@ -136,18 +144,18 @@ curl http://localhost:8000/events/178f3ad6-0b24-42fa-8589-b6b32effa24b
 
 ## Endpoints
 
-| Método | Rota | Descrição |
-|---|---|---|
-| `POST` | `/webhooks/events` | Recebe um evento e responde `202`. Com `Idempotency-Key` repetida, responde `200` com o evento original e não processa de novo |
-| `GET` | `/events` | Lista eventos, do mais novo para o mais antigo. Filtros: `status`, `name`, `source`, `limit`, `skip` |
-| `GET` | `/events/{id}` | Detalhes e status de um evento |
-| `POST` | `/events/{id}/retry` | Reenfileira um evento `failed` (zera as tentativas) |
-| `GET` | `/events/stats` | Quantidade de eventos por status e tamanho das filas |
-| `GET` | `/health` | Verifica a conexão com MongoDB e Redis |
+| Method | Route                | Description                                                                                                                                                           |
+| ------ | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/webhooks/events`   | Receives an event and responds with `202`. If an existing `Idempotency-Key` is reused, responds with `200` and returns the original event without processing it again |
+| `GET`  | `/events`            | Lists events, newest first. Filters: `status`, `name`, `source`, `limit`, `skip`                                                                                      |
+| `GET`  | `/events/{id}`       | Retrieves an event's details and current status                                                                                                                       |
+| `POST` | `/events/{id}/retry` | Re-enqueues a `failed` event (resets the attempt counter)                                                                                                             |
+| `GET`  | `/events/stats`      | Returns event counts by status and queue sizes                                                                                                                        |
+| `GET`  | `/health`            | Checks MongoDB and Redis connectivity                                                                                                                                 |
 
-## Criando handlers
+## Creating handlers
 
-Um *handler* é a função que faz o trabalho de verdade quando um evento chega. Crie um módulo em `app/handlers/`:
+A _handler_ is a function that performs the actual work when an event is received. Create a module inside `app/handlers/`:
 
 ```python
 # app/handlers/orders.py
@@ -158,68 +166,68 @@ from app.services.event.handlers import registry
 @registry.on("order.paid")
 async def update_stock(event: Event):
     order_id = event.payload["order_id"]
-    ...  # se levantar exceção, o evento será tentado de novo
+    ...  # If an exception is raised, the event will be retried
 ```
 
-E importe-o em `app/handlers/__init__.py`:
+Then import it in `app/handlers/__init__.py`:
 
 ```python
 from . import default, orders  # noqa: F401
 ```
 
-Regras:
+Rules:
 
-- Um mesmo evento pode ter vários handlers; eles rodam um depois do outro, primeiro os de `"*"` e depois os específicos, cada grupo na ordem de registro. Se um falhar, os seguintes não rodam nessa tentativa.
-- Handlers registrados com `@registry.on("*")` rodam para todos os eventos (o `default.py` usa isso para logar).
-- Qualquer exceção ou estouro de tempo (`WORKER_HANDLER_TIMEOUT`) conta como falha e gera retry.
-- A entrega é **pelo menos uma vez** (*at-least-once*): em casos raros, como queda do worker no meio do processamento, um handler pode rodar mais de uma vez para o mesmo evento. Escreva handlers que aguentem isso (idempotentes).
+- A single event can have multiple handlers. They execute sequentially: wildcard (`"*"`) handlers run first, followed by event-specific handlers. Within each group, execution follows registration order. If a handler fails, subsequent handlers are skipped for that attempt.
+- Handlers registered with `@registry.on("*")` run for every event (`default.py` uses this to handle logging).
+- Any exception or timeout (`WORKER_HANDLER_TIMEOUT`) is treated as a failure and triggers a retry.
+- Delivery follows an **at-least-once** guarantee: in rare situations, such as a worker crashing midway through processing, a handler may execute more than once for the same event. Make sure your handlers can safely handle duplicate executions (i.e., make them idempotent).
 
-## Configuração
+## Configuration
 
-Variáveis lidas do `.env` ou do ambiente:
+Environment variables read from `.env` or the system environment:
 
-| Variável | Padrão | Descrição |
-|---|---|---|
-| `MONGO_URI` | — | URI de conexão do MongoDB (obrigatória) |
-| `MONGO_DATABASE` | — | Nome do banco (obrigatória) |
-| `REDIS_URL` | — | URL do Redis (obrigatória) |
-| `EVENT_QUEUE_PREFIX` | `events` | Prefixo das chaves no Redis |
-| `WORKER_CONCURRENCY` | `4` | Eventos processados em paralelo por worker |
-| `WORKER_MAX_ATTEMPTS` | `5` | Tentativas antes de marcar como `failed` |
-| `WORKER_RETRY_BASE_DELAY` | `2` | Espera do primeiro retry, em segundos (dobra a cada tentativa) |
-| `WORKER_RETRY_MAX_DELAY` | `300` | Espera máxima entre retries, em segundos |
-| `WORKER_HANDLER_TIMEOUT` | `30` | Tempo máximo de cada handler, em segundos |
-| `RUN_EMBEDDED_WORKER` | `false` | Roda o worker dentro do processo da API |
+| Variable                  | Default  | Description                                                    |
+| ------------------------- | -------- | -------------------------------------------------------------- |
+| `MONGO_URI`               | —        | MongoDB connection URI (required)                              |
+| `MONGO_DATABASE`          | —        | Database name (required)                                       |
+| `REDIS_URL`               | —        | Redis connection URL (required)                                |
+| `EVENT_QUEUE_PREFIX`      | `events` | Prefix used for Redis keys                                     |
+| `WORKER_CONCURRENCY`      | `4`      | Number of events processed concurrently by each worker         |
+| `WORKER_MAX_ATTEMPTS`     | `5`      | Maximum number of attempts before marking an event as `failed` |
+| `WORKER_RETRY_BASE_DELAY` | `2`      | Initial retry delay in seconds (doubles with each attempt)     |
+| `WORKER_RETRY_MAX_DELAY`  | `300`    | Maximum delay between retries, in seconds                      |
+| `WORKER_HANDLER_TIMEOUT`  | `30`     | Maximum execution time for each handler, in seconds            |
+| `RUN_EMBEDDED_WORKER`     | `false`  | Runs the worker inside the API process                         |
 
-## Estrutura do projeto
+## Project structure
 
-```
+```text
 app/
-├── main.py                  # app FastAPI, ciclo de vida e /health
+├── main.py                  # FastAPI application, lifecycle, and /health
 ├── controllers/
 │   ├── webhook.py           # POST /webhooks/events
-│   └── events.py            # consulta, estatísticas e retry
-├── schemas/event.py         # modelos Event, EventCreate e status
+│   └── events.py             # Event queries, statistics, and retries
+├── schemas/event.py          # Event, EventCreate, and status models
 ├── services/
 │   ├── event/
-│   │   ├── event.py         # persistência e transições de status no MongoDB
-│   │   ├── event_queue.py   # filas no Redis (principal, retries, dead-letter)
-│   │   ├── processor.py     # executa handlers e decide sucesso/retry/falha
-│   │   └── handlers.py      # registro de handlers (@registry.on)
-│   └── redis/redis.py       # wrapper do cliente Redis
-├── handlers/                # seus handlers de eventos
-├── workers/event_worker.py  # processo do worker
-├── database/                # conexões com MongoDB e Redis
-└── core/settings.py         # configurações
-tests/                       # testes (pytest + testcontainers)
+│   │   ├── event.py         # MongoDB persistence and status transitions
+│   │   ├── event_queue.py   # Redis queues (main, retries, dead-letter)
+│   │   ├── processor.py     # Executes handlers and determines success/retry/failure
+│   │   └── handlers.py      # Handler registry (@registry.on)
+│   └── redis/redis.py       # Redis client wrapper
+├── handlers/                # Custom event handlers
+├── workers/event_worker.py  # Worker process
+├── database/                # MongoDB and Redis connections
+└── core/settings.py         # Application settings
+tests/                       # Tests (pytest + testcontainers)
 ```
 
-## Testes
+## Tests
 
-Os testes sobem MongoDB e Redis temporários com *testcontainers*, então só precisam do Docker rodando:
+Tests spin up temporary MongoDB and Redis instances using _testcontainers_, so Docker must be running:
 
 ```bash
 pytest
 ```
 
-> `tests/database/test_mongodb_connection.py` testa a conexão com o MongoDB configurado no `.env` e só passa com ele rodando.
+> `tests/database/test_mongodb_connection.py` tests the connection to the MongoDB instance configured in `.env` and only passes when that instance is running.
