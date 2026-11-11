@@ -12,7 +12,7 @@ client: AsyncIOMotorClient | None = None
 async def connect_to_mongo():
     global client
 
-    client = AsyncIOMotorClient(settings.mongo_uri)
+    client = AsyncIOMotorClient(settings.mongo_uri, tz_aware=True)
 
     await client.admin.command("ping")
 
